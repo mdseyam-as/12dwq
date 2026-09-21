@@ -1109,6 +1109,10 @@ async def auth_verify(request: Request):
         raise HTTPException(status_code=400, detail="Введите 6-значный код")
 
     now = unix_now()
+    wrong_attempts = None
+    wrong_consumed = False
+    expired = False
+
     with db_connect() as conn:
         cleanup_auth(conn)
         row = conn.execute(
@@ -1128,27 +1132,32 @@ async def auth_verify(request: Request):
                 "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
                 (challenge_id,),
             )
-            raise HTTPException(status_code=401, detail="Код истёк. Запросите новый")
+            expired = True
+        else:
+            expected = row["code_hash"]
+            supplied = challenge_code_hash(challenge_id, code)
+            if not hmac.compare_digest(expected, supplied):
+                wrong_attempts = int(row["attempts"]) + 1
+                wrong_consumed = wrong_attempts >= 5
+                conn.execute(
+                    "UPDATE auth_challenge SET attempts = ?, consumed = ? WHERE challenge_id = ?",
+                    (wrong_attempts, int(wrong_consumed), challenge_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
+                    (challenge_id,),
+                )
 
-        expected = row["code_hash"]
-        supplied = challenge_code_hash(challenge_id, code)
-        if not hmac.compare_digest(expected, supplied):
-            attempts = int(row["attempts"]) + 1
-            consumed = 1 if attempts >= 5 else 0
-            conn.execute(
-                "UPDATE auth_challenge SET attempts = ?, consumed = ? WHERE challenge_id = ?",
-                (attempts, consumed, challenge_id),
-            )
-            locked_for = record_auth_failure(ip)
-            await asyncio.sleep(0.35)
-            if consumed or locked_for:
-                raise HTTPException(status_code=429, detail="Слишком много неверных кодов. Начните вход заново")
-            raise HTTPException(status_code=401, detail=f"Неверный код. Осталось попыток: {5 - attempts}")
+    if expired:
+        raise HTTPException(status_code=401, detail="Код истёк. Запросите новый")
 
-        conn.execute(
-            "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
-            (challenge_id,),
-        )
+    if wrong_attempts is not None:
+        locked_for = record_auth_failure(ip)
+        await asyncio.sleep(0.35)
+        if wrong_consumed or locked_for:
+            raise HTTPException(status_code=429, detail="Слишком много неверных кодов. Начните вход заново")
+        raise HTTPException(status_code=401, detail=f"Неверный код. Осталось попыток: {5 - wrong_attempts}")
 
     clear_auth_failures(ip)
     response = JSONResponse({"ok": True})
