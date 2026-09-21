@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import html
 import json
 import os
+import secrets
 import sqlite3
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,6 +31,26 @@ DB_PATH = Path(os.getenv("AZS_DB_PATH", str(DATA_DIR / "azs.sqlite3")))
 POLL_SECONDS = max(60, int(os.getenv("AZS_POLL_SECONDS", "300")))
 CACHE_TTL_SECONDS = max(15, int(os.getenv("AZS_CACHE_TTL_SECONDS", "60")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("AZS_REQUEST_TIMEOUT", "20")))
+
+AUTH_PASSWORD_HASH = os.getenv("AZS_AUTH_PASSWORD_HASH", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("AZS_TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ALLOWED_USER_ID_RAW = os.getenv("AZS_TELEGRAM_ALLOWED_USER_ID", "").strip()
+SESSION_SECRET = os.getenv("AZS_SESSION_SECRET", "").strip()
+SESSION_HOURS = max(1, min(168, int(os.getenv("AZS_SESSION_HOURS", "12"))))
+COOKIE_SECURE = os.getenv("AZS_COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUTH_COOKIE_NAME = "azs_session"
+
+try:
+    TELEGRAM_ALLOWED_USER_ID = int(TELEGRAM_ALLOWED_USER_ID_RAW) if TELEGRAM_ALLOWED_USER_ID_RAW else 0
+except ValueError:
+    TELEGRAM_ALLOWED_USER_ID = 0
+
+AUTH_ENABLED = bool(
+    AUTH_PASSWORD_HASH
+    and TELEGRAM_BOT_TOKEN
+    and TELEGRAM_ALLOWED_USER_ID
+    and SESSION_SECRET
+)
 
 GEOPORTAL_BASE_URL = os.getenv("AZS_GEOPORTAL_BASE_URL", "https://azs.geoportal40.ru/").rstrip("/") + "/"
 GEOPORTAL_API_URL = os.getenv(
@@ -625,6 +650,269 @@ def station_history(station_uid: str, days: int) -> dict[str, Any]:
     }
 
 
+# =========================
+# Authentication / 2FA
+# =========================
+
+def init_auth_db() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS auth_failure (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                failed_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_failure_ip_time
+                ON auth_failure(ip, failed_at);
+
+            CREATE TABLE IF NOT EXISTS auth_lockout (
+                ip TEXT PRIMARY KEY,
+                locked_until INTEGER NOT NULL,
+                level INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_challenge (
+                challenge_id TEXT PRIMARY KEY,
+                ip TEXT NOT NULL,
+                user_agent TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                consumed INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_challenge_exp
+                ON auth_challenge(expires_at);
+
+            CREATE TABLE IF NOT EXISTS auth_session (
+                token_hash TEXT PRIMARY KEY,
+                ip TEXT NOT NULL,
+                user_agent TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auth_session_exp
+                ON auth_session(expires_at);
+            """
+        )
+
+
+def unix_now() -> int:
+    return int(time.time())
+
+
+def client_ip(request: Request) -> str:
+    # We deliberately do not trust X-Forwarded-For until a trusted reverse proxy
+    # is configured. This prevents clients from spoofing their source IP.
+    return request.client.host if request.client else "unknown"
+
+
+def short_ua(request: Request) -> str:
+    return clean_text(request.headers.get("user-agent", ""))[:240]
+
+
+def password_matches(password: str) -> bool:
+    try:
+        scheme, n_raw, r_raw, p_raw, salt_hex, expected_hex = AUTH_PASSWORD_HASH.split(":", 5)
+        if scheme != "scrypt":
+            return False
+        expected = bytes.fromhex(expected_hex)
+        candidate = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n_raw),
+            r=int(r_raw),
+            p=int(p_raw),
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(candidate, expected)
+    except Exception:
+        return False
+
+
+def cleanup_auth(conn: sqlite3.Connection) -> None:
+    now = unix_now()
+    conn.execute("DELETE FROM auth_failure WHERE failed_at < ?", (now - 86400,))
+    conn.execute("DELETE FROM auth_challenge WHERE expires_at < ?", (now - 3600,))
+    conn.execute("DELETE FROM auth_session WHERE expires_at < ?", (now,))
+
+
+def lockout_remaining(ip: str) -> int:
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        row = conn.execute(
+            "SELECT locked_until FROM auth_lockout WHERE ip = ?",
+            (ip,),
+        ).fetchone()
+        if row is None:
+            return 0
+        return max(0, int(row["locked_until"]) - unix_now())
+
+
+def record_auth_failure(ip: str) -> int:
+    now = unix_now()
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        conn.execute(
+            "INSERT INTO auth_failure(ip, failed_at) VALUES (?, ?)",
+            (ip, now),
+        )
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM auth_failure WHERE ip = ? AND failed_at >= ?",
+            (ip, now - 600),
+        ).fetchone()["n"]
+
+        if count < 5:
+            return 0
+
+        previous = conn.execute(
+            "SELECT level, locked_until FROM auth_lockout WHERE ip = ?",
+            (ip,),
+        ).fetchone()
+        level = 0
+        if previous is not None:
+            level = min(6, int(previous["level"]) + 1)
+
+        # 15m, 30m, 1h, 2h, 4h, 8h, max 12h.
+        seconds = min(43200, 900 * (2 ** level))
+        locked_until = now + seconds
+
+        conn.execute(
+            """
+            INSERT INTO auth_lockout(ip, locked_until, level, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ip) DO UPDATE SET
+                locked_until=excluded.locked_until,
+                level=excluded.level,
+                updated_at=excluded.updated_at
+            """,
+            (ip, locked_until, level, now),
+        )
+        conn.execute("DELETE FROM auth_failure WHERE ip = ?", (ip,))
+        return seconds
+
+
+def clear_auth_failures(ip: str) -> None:
+    with db_connect() as conn:
+        conn.execute("DELETE FROM auth_failure WHERE ip = ?", (ip,))
+        conn.execute("DELETE FROM auth_lockout WHERE ip = ?", (ip,))
+
+
+def challenge_code_hash(challenge_id: str, code: str) -> str:
+    payload = f"{challenge_id}:{code}:{SESSION_SECRET}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def session_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def get_session(request: Request) -> sqlite3.Row | None:
+    token = request.cookies.get(AUTH_COOKIE_NAME, "")
+    if not token:
+        return None
+    digest = session_token_hash(token)
+    now = unix_now()
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        row = conn.execute(
+            """
+            SELECT token_hash, ip, user_agent, created_at, expires_at
+            FROM auth_session
+            WHERE token_hash = ? AND expires_at > ?
+            """,
+            (digest, now),
+        ).fetchone()
+        return row
+
+
+def is_authenticated(request: Request) -> bool:
+    return (not AUTH_ENABLED) or get_session(request) is not None
+
+
+def telegram_send_code(code: str, ip: str, user_agent: str) -> None:
+    if not AUTH_ENABLED:
+        raise RuntimeError("Authentication is not configured")
+
+    message = (
+        "<b>Вход в Мониторинг АЗС</b>\n\n"
+        f"Код подтверждения: <code>{html.escape(code)}</code>\n"
+        "Действует 3 минуты.\n\n"
+        f"IP: <code>{html.escape(ip)}</code>\n"
+        f"Устройство: {html.escape(user_agent[:140] or 'не определено')}\n\n"
+        "Если это не вы, никому не сообщайте код."
+    )
+    body = urllib.parse.urlencode(
+        {
+            "chat_id": str(TELEGRAM_ALLOWED_USER_ID),
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError("Telegram rejected the login notification")
+
+
+def create_session(response: Response, request: Request) -> None:
+    raw_token = secrets.token_urlsafe(48)
+    digest = session_token_hash(raw_token)
+    now = unix_now()
+    expires = now + SESSION_HOURS * 3600
+
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        conn.execute(
+            """
+            INSERT INTO auth_session(token_hash, ip, user_agent, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (digest, client_ip(request), short_ua(request), now, expires),
+        )
+
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        raw_token,
+        max_age=SESSION_HOURS * 3600,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+
+
+PUBLIC_PATHS = {
+    "/login",
+    "/api/health",
+    "/api/auth/status",
+    "/api/auth/password",
+    "/api/auth/verify",
+    "/favicon.ico",
+}
+
+
+async def read_json(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
 async def poller() -> None:
     while True:
         try:
@@ -637,6 +925,7 @@ async def poller() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    init_auth_db()
     try:
         await asyncio.to_thread(refresh_geoportal, False)
     except Exception:
@@ -653,13 +942,232 @@ async def lifespan(_: FastAPI):
             pass
 
 
-app = FastAPI(title="Geoportal40 AZS Dashboard", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Geoportal40 AZS Dashboard",
+    version="1.1.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def auth_and_security_middleware(request: Request, call_next):
+    path = request.url.path
+    public = (
+        path in PUBLIC_PATHS
+        or path.startswith("/static/")
+        or path.startswith("/api/auth/")
+    )
+
+    if AUTH_ENABLED and not public and not is_authenticated(request):
+        if path.startswith("/api/"):
+            response = JSONResponse({"detail": "Требуется авторизация"}, status_code=401)
+        else:
+            response = RedirectResponse("/login", status_code=303)
+    else:
+        response = await call_next(request)
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-src https://azs.geoportal40.ru; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; form-action 'self'"
+    )
+    return response
+
+
 @app.get("/")
-def index() -> FileResponse:
+def index(request: Request):
+    if AUTH_ENABLED and not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/login")
+def login_page(request: Request):
+    if AUTH_ENABLED and is_authenticated(request):
+        return RedirectResponse("/", status_code=303)
+    return FileResponse(STATIC_DIR / "login.html")
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request) -> dict[str, Any]:
+    return {
+        "configured": AUTH_ENABLED,
+        "authenticated": bool(AUTH_ENABLED and is_authenticated(request)),
+        "telegram_bot": "@my_fed_helper_robot",
+        "session_hours": SESSION_HOURS,
+    }
+
+
+@app.post("/api/auth/password")
+async def auth_password(request: Request):
+    if not AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Авторизация ещё не настроена на сервере")
+
+    ip = client_ip(request)
+    remaining = lockout_remaining(ip)
+    if remaining > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Слишком много попыток. Повторите через {max(1, (remaining + 59) // 60)} мин.",
+            headers={"Retry-After": str(remaining)},
+        )
+
+    payload = await read_json(request)
+    password = str(payload.get("password", ""))
+    if not password or len(password) > 256 or not password_matches(password):
+        locked_for = record_auth_failure(ip)
+        await asyncio.sleep(0.55)
+        if locked_for:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Слишком много попыток. Вход заблокирован на {max(1, locked_for // 60)} мин.",
+                headers={"Retry-After": str(locked_for)},
+            )
+        raise HTTPException(status_code=401, detail="Неверный пароль")
+
+    clear_auth_failures(ip)
+
+    challenge_id = secrets.token_urlsafe(32)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = unix_now()
+    expires = now + 180
+    ua = short_ua(request)
+
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        conn.execute(
+            """
+            INSERT INTO auth_challenge(
+                challenge_id, ip, user_agent, code_hash,
+                created_at, expires_at, attempts, consumed
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+            """,
+            (
+                challenge_id,
+                ip,
+                ua,
+                challenge_code_hash(challenge_id, code),
+                now,
+                expires,
+            ),
+        )
+
+    try:
+        await asyncio.to_thread(telegram_send_code, code, ip, ua)
+    except Exception:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
+                (challenge_id,),
+            )
+        raise HTTPException(
+            status_code=502,
+            detail="Не удалось отправить код в Telegram. Проверьте бота и повторите вход.",
+        )
+
+    return {
+        "ok": True,
+        "challenge_id": challenge_id,
+        "expires_in": 180,
+        "telegram_bot": "@my_fed_helper_robot",
+    }
+
+
+@app.post("/api/auth/verify")
+async def auth_verify(request: Request):
+    if not AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Авторизация ещё не настроена на сервере")
+
+    ip = client_ip(request)
+    remaining = lockout_remaining(ip)
+    if remaining > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Слишком много попыток. Повторите через {max(1, (remaining + 59) // 60)} мин.",
+            headers={"Retry-After": str(remaining)},
+        )
+
+    payload = await read_json(request)
+    challenge_id = str(payload.get("challenge_id", ""))[:200]
+    code = str(payload.get("code", "")).strip()
+
+    if not challenge_id or not (len(code) == 6 and code.isdigit()):
+        raise HTTPException(status_code=400, detail="Введите 6-значный код")
+
+    now = unix_now()
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        row = conn.execute(
+            """
+            SELECT challenge_id, ip, code_hash, expires_at, attempts, consumed
+            FROM auth_challenge
+            WHERE challenge_id = ?
+            """,
+            (challenge_id,),
+        ).fetchone()
+
+        if row is None or row["consumed"]:
+            raise HTTPException(status_code=401, detail="Запрос на вход недействителен")
+
+        if int(row["expires_at"]) < now:
+            conn.execute(
+                "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
+                (challenge_id,),
+            )
+            raise HTTPException(status_code=401, detail="Код истёк. Запросите новый")
+
+        expected = row["code_hash"]
+        supplied = challenge_code_hash(challenge_id, code)
+        if not hmac.compare_digest(expected, supplied):
+            attempts = int(row["attempts"]) + 1
+            consumed = 1 if attempts >= 5 else 0
+            conn.execute(
+                "UPDATE auth_challenge SET attempts = ?, consumed = ? WHERE challenge_id = ?",
+                (attempts, consumed, challenge_id),
+            )
+            locked_for = record_auth_failure(ip)
+            await asyncio.sleep(0.35)
+            if consumed or locked_for:
+                raise HTTPException(status_code=429, detail="Слишком много неверных кодов. Начните вход заново")
+            raise HTTPException(status_code=401, detail=f"Неверный код. Осталось попыток: {5 - attempts}")
+
+        conn.execute(
+            "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
+            (challenge_id,),
+        )
+
+    clear_auth_failures(ip)
+    response = JSONResponse({"ok": True})
+    create_session(response, request)
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    token = request.cookies.get(AUTH_COOKIE_NAME, "")
+    if token:
+        with db_connect() as conn:
+            conn.execute(
+                "DELETE FROM auth_session WHERE token_hash = ?",
+                (session_token_hash(token),),
+            )
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    return response
 
 
 @app.get("/api/health")
@@ -683,6 +1191,7 @@ def health() -> dict[str, Any]:
         "current_fetch_stations": current_fetch_rows,
         "poll_seconds": POLL_SECONDS,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "auth_configured": AUTH_ENABLED,
     }
 
 

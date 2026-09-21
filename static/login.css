@@ -1,0 +1,32 @@
+
+:root{--text:#17324d;--muted:#7890a5;--blue:#167fcf;--line:#d4e6f4;--ok:#1ea171;--danger:#c94c5b}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;color:var(--text);background:radial-gradient(circle at 80% 0,rgba(38,127,209,.14),transparent 32%),linear-gradient(145deg,#f9fcff,#e9f5ff)}
+body{min-height:100dvh}
+button,input{font:inherit}
+.auth-shell{min-height:100dvh;display:grid;place-items:center;padding:18px}
+.auth-card{width:min(100%,430px);padding:24px;border:1px solid #bedcf2;border-radius:24px;background:rgba(255,255,255,.9);box-shadow:0 20px 55px rgba(40,91,138,.12);backdrop-filter:blur(14px)}
+.brand{display:flex;align-items:center;gap:13px}
+.brand-icon{display:grid;place-items:center;width:52px;height:52px;flex:0 0 52px;border-radius:16px;background:linear-gradient(145deg,#0876d1,#27a9ee);color:#fff;box-shadow:0 10px 24px rgba(8,118,209,.22)}
+.brand-icon svg{width:29px;height:29px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.eyebrow{font-size:10px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--blue)}
+h1{margin:3px 0 0;font-size:25px;line-height:1.1}
+.auth-status{display:flex;align-items:center;gap:10px;margin:20px 0 16px;padding:11px 12px;border:1px solid #dceaf5;border-radius:14px;background:#f7fbff}
+.status-dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 5px rgba(30,161,113,.12)}
+.auth-status strong,.auth-status small{display:block}.auth-status strong{font-size:12px}.auth-status small{margin-top:3px;color:var(--muted);font-size:10px}
+.auth-form{display:grid;gap:12px}
+.auth-form label{display:grid;gap:6px}.auth-form label>span{font-size:10px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:#6f879a}
+.auth-form input{width:100%;height:48px;border:1px solid #cfe1ef;border-radius:13px;padding:0 14px;outline:none;background:#fff;color:var(--text);font-size:16px}
+.auth-form input:focus{border-color:#75b2e4;box-shadow:0 0 0 4px rgba(38,127,209,.09)}
+.auth-form button{height:46px;border:0;border-radius:13px;background:linear-gradient(145deg,#0876d1,#159ce9);color:#fff;font-weight:800;cursor:pointer}
+.auth-form button:disabled{opacity:.55;cursor:wait}
+.auth-form .secondary{border:1px solid #d4e4ef;background:#fff;color:#5f7890}
+.notice{margin-bottom:12px;padding:10px 12px;border:1px solid #efd0d4;border-radius:12px;background:#fff7f8;color:#a43e4b;font-size:11px}
+.notice.ok{border-color:#c8e9dc;background:#f4fbf8;color:#147b58}
+.telegram-box{display:flex;gap:10px;padding:11px;border:1px solid #cfe5f4;border-radius:13px;background:#f4faff}
+.telegram-icon{display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:50%;background:#229ed9;color:#fff;font-size:18px}
+.telegram-box strong,.telegram-box small{display:block}.telegram-box strong{font-size:11px}.telegram-box small{margin-top:3px;color:var(--muted);font-size:9px;line-height:1.4}
+.countdown{text-align:center;min-height:18px;color:var(--muted);font-size:9px}
+footer{margin-top:18px;padding-top:13px;border-top:1px solid #e2edf5;text-align:center;color:#8ca0b0;font-size:9px}
+[hidden]{display:none!important}
+@media(max-width:480px){.auth-shell{padding:10px}.auth-card{padding:18px;border-radius:20px}h1{font-size:22px}.brand-icon{width:46px;height:46px;flex-basis:46px}.auth-form input{height:46px}}

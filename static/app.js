@@ -57,6 +57,10 @@ async function api(url, options={}){
   const response = await fetch(url,{cache:"no-store",...options});
   let body = null;
   try{ body = await response.json(); }catch(_){}
+  if(response.status === 401){
+    window.location.replace("/login");
+    throw new Error("Сессия истекла");
+  }
   if(!response.ok){
     const detail = body?.detail || `${response.status} ${response.statusText}`;
     throw new Error(detail);
@@ -464,6 +468,13 @@ function resetFilters(){
   resetDrill();
 }
 
+async function logout(){
+  try{
+    await fetch("/api/auth/logout",{method:"POST",cache:"no-store"});
+  }catch(_){}
+  window.location.replace("/login");
+}
+
 function bind(){
   $("#fuelFilter").addEventListener("change",event=>{
     state.fuel = event.target.value;
@@ -494,6 +505,7 @@ function bind(){
   $("#backBtn").addEventListener("click",resetDrill);
   $("#resetBtn").addEventListener("click",resetFilters);
   $("#refreshBtn").addEventListener("click",forceRefresh);
+  $("#logoutBtn")?.addEventListener("click",logout);
   $("#mapReset").addEventListener("click",resetMap);
   $("#mapFrame").addEventListener("load",()=>$("#mapLoader").classList.add("hidden"));
 }

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Вход — Мониторинг АЗС</title>
+  <meta name="theme-color" content="#eef7ff">
+  <link rel="stylesheet" href="/static/login.css">
+</head>
+<body>
+  <main class="auth-shell">
+    <section class="auth-card">
+      <div class="brand">
+        <div class="brand-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M7 21V5.5A2.5 2.5 0 0 1 9.5 3h5A2.5 2.5 0 0 1 17 5.5V21"></path>
+            <rect x="9" y="6" width="6" height="5" rx="1"></rect>
+            <path d="M17 8h1.5l2 2.5V16a2 2 0 0 1-2 2H17"></path>
+            <path d="M5 21h14"></path>
+          </svg>
+        </div>
+        <div>
+          <div class="eyebrow">Калужская область</div>
+          <h1>Мониторинг АЗС</h1>
+        </div>
+      </div>
+
+      <div class="auth-status">
+        <span class="status-dot"></span>
+        <div>
+          <strong>Защищённый вход</strong>
+          <small>Пароль + подтверждение через Telegram</small>
+        </div>
+      </div>
+
+      <div class="notice" id="notice" hidden></div>
+
+      <form id="passwordForm" class="auth-form">
+        <label>
+          <span>Пароль</span>
+          <input id="password" type="password" autocomplete="current-password" maxlength="256" required autofocus>
+        </label>
+        <button id="passwordBtn" type="submit">Продолжить</button>
+      </form>
+
+      <form id="codeForm" class="auth-form" hidden>
+        <div class="telegram-box">
+          <div class="telegram-icon">✈</div>
+          <div>
+            <strong>Код отправлен в Telegram</strong>
+            <small>Сообщение придёт от <b>@my_fed_helper_robot</b>. Код действует 3 минуты.</small>
+          </div>
+        </div>
+
+        <label>
+          <span>Код подтверждения</span>
+          <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="000000" required>
+        </label>
+        <button id="verifyBtn" type="submit">Войти</button>
+        <button id="backBtn" class="secondary" type="button">Вернуться к паролю</button>
+        <div class="countdown" id="countdown"></div>
+      </form>
+
+      <footer>
+        <span>Доступ только после двухэтапной проверки</span>
+      </footer>
+    </section>
+  </main>
+  <script src="/static/login.js" defer></script>
+</body>
+</html>

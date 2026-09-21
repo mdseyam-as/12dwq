@@ -132,3 +132,12 @@ h1{margin:3px 0;font-size:25px;line-height:1.15}.subtitle{color:var(--muted);fon
   .filters .field:nth-child(3),.field-search,.reset-btn{grid-column:1/-1}
   .map-frame-wrap{height:285px}
 }
+
+/* ===== Authentication controls ===== */
+.source-actions{display:flex;gap:6px;align-items:center}
+.logout-btn{height:30px;padding:0 10px;border:1px solid #d7e5ef;border-radius:10px;background:#fff;color:#6b8092;font-size:10px;font-weight:750;cursor:pointer}
+.logout-btn:hover{border-color:#efc9ce;background:#fff7f8;color:#a24851}
+@media(max-width:720px){
+  .source-actions{gap:4px}
+  .logout-btn{height:28px;padding:0 8px;font-size:8px}
+}
