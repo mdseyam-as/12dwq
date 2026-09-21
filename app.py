@@ -119,6 +119,48 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_station_last_fetch
                 ON station(last_fetch_id);
+
+            -- v2 tables use a stable synthetic UID so Geoportal source IDs may repeat
+            -- without collapsing different stations into one SQLite row.
+            CREATE TABLE IF NOT EXISTS station_v2 (
+                station_uid TEXT PRIMARY KEY,
+                source_id TEXT,
+                owner_raw TEXT NOT NULL,
+                owner_group TEXT NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                longitude REAL NOT NULL,
+                latitude REAL NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_fetch_id INTEGER,
+                FOREIGN KEY(last_fetch_id) REFERENCES fetch_log(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshot_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                station_uid TEXT NOT NULL,
+                fetched_at TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                ai92 INTEGER NOT NULL,
+                ai95 INTEGER NOT NULL,
+                ai95_1 INTEGER NOT NULL,
+                dt INTEGER NOT NULL,
+                dt_1 INTEGER NOT NULL,
+                ai98 INTEGER NOT NULL,
+                ai100 INTEGER NOT NULL,
+                state_hash TEXT NOT NULL,
+                FOREIGN KEY(station_uid) REFERENCES station_v2(station_uid)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snapshot_v2_station_date
+                ON snapshot_v2(station_uid, snapshot_date, fetched_at);
+
+            CREATE INDEX IF NOT EXISTS idx_snapshot_v2_date
+                ON snapshot_v2(snapshot_date, fetched_at);
+
+            CREATE INDEX IF NOT EXISTS idx_station_v2_last_fetch
+                ON station_v2(last_fetch_id);
             """
         )
 
@@ -142,6 +184,21 @@ def normalize_owner(owner: str) -> str:
     if "калуганефтепродукт" in owner.lower():
         return "Калуганефтепродукт"
     return owner or "Не указан"
+
+
+def make_station_uid(source_id: Any, longitude: float, latitude: float, address: str, name: str) -> str:
+    # Geoportal's source ID is useful metadata but must not be assumed globally unique.
+    # Coordinates + address/name keep the identifier stable while preventing collisions.
+    raw = "|".join(
+        [
+            clean_text(source_id),
+            f"{longitude:.6f}",
+            f"{latitude:.6f}",
+            clean_text(address).lower(),
+            clean_text(name).lower(),
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def fetch_geoportal() -> dict[str, Any]:
@@ -183,21 +240,23 @@ def parse_geojson(payload: dict[str, Any]) -> list[dict[str, Any]]:
         coords = geom.get("coordinates") or []
 
         try:
-            station_id = int(props.get("id", feature.get("id")))
             lon = float(coords[0])
             lat = float(coords[1])
         except (TypeError, ValueError, IndexError):
             continue
 
+        source_id = clean_text(props.get("id", feature.get("id")))
         owner_raw = clean_text(props.get("name2"))
-        name = clean_text(props.get("name3")) or f"АЗС {station_id}"
+        name = clean_text(props.get("name3")) or (f"АЗС {source_id}" if source_id else "АЗС")
         address = clean_text(props.get("address"))
+        station_uid = make_station_uid(source_id, lon, lat, address, name)
 
         fuels = {key: as_bool(props.get(key)) for key in FUEL_KEYS}
 
         rows.append(
             {
-                "station_id": station_id,
+                "station_uid": station_uid,
+                "source_id": source_id,
                 "owner_raw": owner_raw,
                 "owner_group": normalize_owner(owner_raw),
                 "name": name,
@@ -211,7 +270,7 @@ def parse_geojson(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if not rows:
         raise RuntimeError("Geoportal returned no valid stations")
 
-    rows.sort(key=lambda x: x["station_id"])
+    rows.sort(key=lambda x: (x["owner_group"].lower(), x["name"].lower(), x["station_uid"]))
     return rows
 
 
@@ -275,12 +334,13 @@ def store_fetch(rows: list[dict[str, Any]], fetched_at: datetime) -> dict[str, A
         for row in rows:
             conn.execute(
                 """
-                INSERT INTO station(
-                    station_id, owner_raw, owner_group, name, address,
+                INSERT INTO station_v2(
+                    station_uid, source_id, owner_raw, owner_group, name, address,
                     longitude, latitude, first_seen_at, last_seen_at, last_fetch_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(station_id) DO UPDATE SET
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(station_uid) DO UPDATE SET
+                    source_id=excluded.source_id,
                     owner_raw=excluded.owner_raw,
                     owner_group=excluded.owner_group,
                     name=excluded.name,
@@ -291,7 +351,8 @@ def store_fetch(rows: list[dict[str, Any]], fetched_at: datetime) -> dict[str, A
                     last_fetch_id=excluded.last_fetch_id
                 """,
                 (
-                    row["station_id"],
+                    row["station_uid"],
+                    row["source_id"],
                     row["owner_raw"],
                     row["owner_group"],
                     row["name"],
@@ -308,12 +369,12 @@ def store_fetch(rows: list[dict[str, Any]], fetched_at: datetime) -> dict[str, A
             prev = conn.execute(
                 """
                 SELECT snapshot_date, state_hash
-                FROM snapshot
-                WHERE station_id = ?
+                FROM snapshot_v2
+                WHERE station_uid = ?
                 ORDER BY fetched_at DESC, id DESC
                 LIMIT 1
                 """,
-                (row["station_id"],),
+                (row["station_uid"],),
             ).fetchone()
 
             should_insert = (
@@ -325,14 +386,14 @@ def store_fetch(rows: list[dict[str, Any]], fetched_at: datetime) -> dict[str, A
             if should_insert:
                 conn.execute(
                     """
-                    INSERT INTO snapshot(
-                        station_id, fetched_at, snapshot_date,
+                    INSERT INTO snapshot_v2(
+                        station_uid, fetched_at, snapshot_date,
                         ai92, ai95, ai95_1, dt, dt_1, ai98, ai100, state_hash
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row["station_id"],
+                        row["station_uid"],
                         fetched,
                         snap_date,
                         int(row["ai92"]),
@@ -356,7 +417,6 @@ def store_fetch(rows: list[dict[str, Any]], fetched_at: datetime) -> dict[str, A
         "inserted_snapshots": inserted_snapshots,
     }
 
-
 def record_failure(error: Exception) -> None:
     message = clean_text(str(error))[:1000] or error.__class__.__name__
     with db_connect() as conn:
@@ -370,9 +430,11 @@ def refresh_geoportal(force: bool = False) -> dict[str, Any]:
     with _REFRESH_LOCK:
         with db_connect() as conn:
             previous = last_success_fetch(conn)
+            v2_count = conn.execute("SELECT COUNT(*) AS n FROM station_v2").fetchone()["n"]
             if (
                 not force
                 and previous is not None
+                and v2_count > 0
                 and seconds_since(previous["fetched_at"]) < CACHE_TTL_SECONDS
             ):
                 return {
@@ -403,7 +465,8 @@ def refresh_geoportal(force: bool = False) -> dict[str, Any]:
 def serialize_station(row: sqlite3.Row) -> dict[str, Any]:
     fuels = {key: bool(row[key]) for key in FUEL_KEYS}
     return {
-        "id": row["station_id"],
+        "id": row["station_uid"],
+        "source_id": row["source_id"],
         "owner_raw": row["owner_raw"],
         "owner": row["owner_group"],
         "name": row["name"],
@@ -417,7 +480,6 @@ def serialize_station(row: sqlite3.Row) -> dict[str, Any]:
         "portal_url": f"{GEOPORTAL_BASE_URL}#{row['longitude']}_{row['latitude']}_17",
     }
 
-
 def get_current_stations() -> tuple[list[dict[str, Any]], sqlite3.Row | None]:
     with db_connect() as conn:
         fetch = last_success_fetch(conn)
@@ -427,15 +489,15 @@ def get_current_stations() -> tuple[list[dict[str, Any]], sqlite3.Row | None]:
         rows = conn.execute(
             """
             SELECT
-                s.station_id, s.owner_raw, s.owner_group, s.name, s.address,
+                s.station_uid, s.source_id, s.owner_raw, s.owner_group, s.name, s.address,
                 s.longitude, s.latitude,
                 ? AS fetched_at, p.snapshot_date,
                 p.ai92, p.ai95, p.ai95_1, p.dt, p.dt_1, p.ai98, p.ai100
-            FROM station s
-            JOIN snapshot p ON p.id = (
+            FROM station_v2 s
+            JOIN snapshot_v2 p ON p.id = (
                 SELECT p2.id
-                FROM snapshot p2
-                WHERE p2.station_id = s.station_id
+                FROM snapshot_v2 p2
+                WHERE p2.station_uid = s.station_uid
                 ORDER BY p2.fetched_at DESC, p2.id DESC
                 LIMIT 1
             )
@@ -453,15 +515,15 @@ def get_historical_stations(snapshot_date: str) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT
-                s.station_id, s.owner_raw, s.owner_group, s.name, s.address,
+                s.station_uid, s.source_id, s.owner_raw, s.owner_group, s.name, s.address,
                 s.longitude, s.latitude,
                 p.fetched_at, p.snapshot_date,
                 p.ai92, p.ai95, p.ai95_1, p.dt, p.dt_1, p.ai98, p.ai100
-            FROM station s
-            JOIN snapshot p ON p.id = (
+            FROM station_v2 s
+            JOIN snapshot_v2 p ON p.id = (
                 SELECT p2.id
-                FROM snapshot p2
-                WHERE p2.station_id = s.station_id
+                FROM snapshot_v2 p2
+                WHERE p2.station_uid = s.station_uid
                   AND p2.snapshot_date = ?
                 ORDER BY p2.fetched_at DESC, p2.id DESC
                 LIMIT 1
@@ -478,7 +540,7 @@ def available_dates(limit: int = 120) -> list[str]:
         rows = conn.execute(
             """
             SELECT DISTINCT snapshot_date
-            FROM snapshot
+            FROM snapshot_v2
             ORDER BY snapshot_date DESC
             LIMIT ?
             """,
@@ -487,18 +549,18 @@ def available_dates(limit: int = 120) -> list[str]:
     return [row["snapshot_date"] for row in rows]
 
 
-def station_history(station_id: int, days: int) -> dict[str, Any]:
+def station_history(station_uid: str, days: int) -> dict[str, Any]:
     end = now_msk().date()
     start = end - timedelta(days=days - 1)
 
     with db_connect() as conn:
         station = conn.execute(
             """
-            SELECT station_id, owner_group, name, address, longitude, latitude
-            FROM station
-            WHERE station_id = ?
+            SELECT station_uid, source_id, owner_group, name, address, longitude, latitude
+            FROM station_v2
+            WHERE station_uid = ?
             """,
-            (station_id,),
+            (station_uid,),
         ).fetchone()
 
         if station is None:
@@ -507,12 +569,12 @@ def station_history(station_id: int, days: int) -> dict[str, Any]:
         rows = conn.execute(
             """
             SELECT *
-            FROM snapshot
-            WHERE station_id = ?
+            FROM snapshot_v2
+            WHERE station_uid = ?
               AND snapshot_date BETWEEN ? AND ?
             ORDER BY snapshot_date ASC, fetched_at ASC, id ASC
             """,
-            (station_id, start.isoformat(), end.isoformat()),
+            (station_uid, start.isoformat(), end.isoformat()),
         ).fetchall()
 
     latest_by_day: dict[str, sqlite3.Row] = {}
@@ -550,7 +612,8 @@ def station_history(station_id: int, days: int) -> dict[str, Any]:
 
     return {
         "station": {
-            "id": station["station_id"],
+            "id": station["station_uid"],
+            "source_id": station["source_id"],
             "owner": station["owner_group"],
             "name": station["name"],
             "address": station["address"],
@@ -603,11 +666,21 @@ def index() -> FileResponse:
 def health() -> dict[str, Any]:
     last_ok = last_success_fetch()
     last_fail = last_failed_fetch()
+    with db_connect() as conn:
+        current_unique = conn.execute("SELECT COUNT(*) AS n FROM station_v2").fetchone()["n"]
+        current_fetch_rows = 0
+        if last_ok is not None:
+            current_fetch_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM station_v2 WHERE last_fetch_id = ?",
+                (last_ok["id"],),
+            ).fetchone()["n"]
     return {
         "ok": last_ok is not None,
         "geoportal_base_url": GEOPORTAL_BASE_URL,
         "last_success": dict(last_ok) if last_ok else None,
         "last_failure": dict(last_fail) if last_fail else None,
+        "stored_stations": current_unique,
+        "current_fetch_stations": current_fetch_rows,
         "poll_seconds": POLL_SECONDS,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
     }
@@ -674,12 +747,12 @@ def stations(
     }
 
 
-@app.get("/api/history/{station_id}")
+@app.get("/api/history/{station_uid}")
 def history(
-    station_id: int,
+    station_uid: str,
     days: int = Query(default=30, ge=1, le=180),
 ) -> dict[str, Any]:
-    return station_history(station_id, days)
+    return station_history(station_uid, days)
 
 
 @app.post("/api/refresh")
