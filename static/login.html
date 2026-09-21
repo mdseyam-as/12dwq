@@ -43,23 +43,26 @@
         <button id="passwordBtn" type="submit">Продолжить</button>
       </form>
 
-      <form id="codeForm" class="auth-form" hidden>
+      <section id="approvalPanel" class="auth-form" hidden>
         <div class="telegram-box">
           <div class="telegram-icon">✈</div>
           <div>
-            <strong>Код отправлен в Telegram</strong>
-            <small>Сообщение придёт от <b>@my_fed_helper_robot</b>. Код действует 3 минуты.</small>
+            <strong>Подтверди вход в Telegram</strong>
+            <small><b>@my_fed_helper_robot</b> отправил запрос с кнопками «Принять» и «Отклонить».</small>
           </div>
         </div>
 
-        <label>
-          <span>Код подтверждения</span>
-          <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="000000" required>
-        </label>
-        <button id="verifyBtn" type="submit">Войти</button>
+        <div class="approval-wait">
+          <span class="approval-spinner" aria-hidden="true"></span>
+          <div>
+            <strong>Ожидаем подтверждение…</strong>
+            <small>После нажатия «Принять» вход завершится автоматически.</small>
+          </div>
+        </div>
+
         <button id="backBtn" class="secondary" type="button">Вернуться к паролю</button>
         <div class="countdown" id="countdown"></div>
-      </form>
+      </section>
 
       <footer>
         <span>Доступ только после двухэтапной проверки</span>

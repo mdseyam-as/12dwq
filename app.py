@@ -38,6 +38,9 @@ TELEGRAM_ALLOWED_USER_ID_RAW = os.getenv("AZS_TELEGRAM_ALLOWED_USER_ID", "").str
 SESSION_SECRET = os.getenv("AZS_SESSION_SECRET", "").strip()
 SESSION_HOURS = max(1, min(168, int(os.getenv("AZS_SESSION_HOURS", "12"))))
 COOKIE_SECURE = os.getenv("AZS_COOKIE_SECURE", "0").strip().lower() in {"1", "true", "yes", "on"}
+TRUST_PROXY_HEADERS = os.getenv("AZS_TRUST_PROXY_HEADERS", "0").strip().lower() in {"1", "true", "yes", "on"}
+PUBLIC_BASE_URL = os.getenv("AZS_PUBLIC_BASE_URL", "").strip().rstrip("/")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("AZS_TELEGRAM_WEBHOOK_SECRET", "").strip()
 AUTH_COOKIE_NAME = "azs_session"
 
 try:
@@ -50,6 +53,11 @@ AUTH_ENABLED = bool(
     and TELEGRAM_BOT_TOKEN
     and TELEGRAM_ALLOWED_USER_ID
     and SESSION_SECRET
+)
+TELEGRAM_APPROVAL_READY = bool(
+    AUTH_ENABLED
+    and TELEGRAM_WEBHOOK_SECRET
+    and PUBLIC_BASE_URL.startswith("https://")
 )
 
 GEOPORTAL_BASE_URL = os.getenv("AZS_GEOPORTAL_BASE_URL", "https://azs.geoportal40.ru/").rstrip("/") + "/"
@@ -678,7 +686,7 @@ def init_auth_db() -> None:
                 challenge_id TEXT PRIMARY KEY,
                 ip TEXT NOT NULL,
                 user_agent TEXT NOT NULL,
-                code_hash TEXT NOT NULL,
+                code_hash TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -701,15 +709,36 @@ def init_auth_db() -> None:
             """
         )
 
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(auth_challenge)").fetchall()
+        }
+        if "status" not in columns:
+            conn.execute(
+                "ALTER TABLE auth_challenge ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            )
+        if "telegram_message_id" not in columns:
+            conn.execute(
+                "ALTER TABLE auth_challenge ADD COLUMN telegram_message_id INTEGER"
+            )
+        if "decision_at" not in columns:
+            conn.execute(
+                "ALTER TABLE auth_challenge ADD COLUMN decision_at INTEGER"
+            )
+
 
 def unix_now() -> int:
     return int(time.time())
 
 
 def client_ip(request: Request) -> str:
-    # We deliberately do not trust X-Forwarded-For until a trusted reverse proxy
-    # is configured. This prevents clients from spoofing their source IP.
-    return request.client.host if request.client else "unknown"
+    if TRUST_PROXY_HEADERS:
+        forwarded = clean_text(request.headers.get("x-forwarded-for", ""))
+        if forwarded:
+            candidate = forwarded.split(",", 1)[0].strip()
+            if candidate:
+                return candidate[:80]
+    return (request.client.host if request.client else "unknown")[:80]
 
 
 def short_ua(request: Request) -> str:
@@ -771,12 +800,10 @@ def record_auth_failure(ip: str) -> int:
             return 0
 
         previous = conn.execute(
-            "SELECT level, locked_until FROM auth_lockout WHERE ip = ?",
+            "SELECT level FROM auth_lockout WHERE ip = ?",
             (ip,),
         ).fetchone()
-        level = 0
-        if previous is not None:
-            level = min(6, int(previous["level"]) + 1)
+        level = min(6, (int(previous["level"]) + 1) if previous else 0)
 
         # 15m, 30m, 1h, 2h, 4h, 8h, max 12h.
         seconds = min(43200, 900 * (2 ** level))
@@ -803,11 +830,6 @@ def clear_auth_failures(ip: str) -> None:
         conn.execute("DELETE FROM auth_lockout WHERE ip = ?", (ip,))
 
 
-def challenge_code_hash(challenge_id: str, code: str) -> str:
-    payload = f"{challenge_id}:{code}:{SESSION_SECRET}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
 def session_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -820,7 +842,7 @@ def get_session(request: Request) -> sqlite3.Row | None:
     now = unix_now()
     with db_connect() as conn:
         cleanup_auth(conn)
-        row = conn.execute(
+        return conn.execute(
             """
             SELECT token_hash, ip, user_agent, created_at, expires_at
             FROM auth_session
@@ -828,44 +850,111 @@ def get_session(request: Request) -> sqlite3.Row | None:
             """,
             (digest, now),
         ).fetchone()
-        return row
 
 
 def is_authenticated(request: Request) -> bool:
     return (not AUTH_ENABLED) or get_session(request) is not None
 
 
-def telegram_send_code(code: str, ip: str, user_agent: str) -> None:
-    if not AUTH_ENABLED:
-        raise RuntimeError("Authentication is not configured")
+def telegram_api(method: str, fields: dict[str, Any]) -> dict[str, Any]:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Telegram bot token is not configured")
 
-    message = (
-        "<b>Вход в Мониторинг АЗС</b>\n\n"
-        f"Код подтверждения: <code>{html.escape(code)}</code>\n"
-        "Действует 3 минуты.\n\n"
-        f"IP: <code>{html.escape(ip)}</code>\n"
-        f"Устройство: {html.escape(user_agent[:140] or 'не определено')}\n\n"
-        "Если это не вы, никому не сообщайте код."
-    )
-    body = urllib.parse.urlencode(
-        {
-            "chat_id": str(TELEGRAM_ALLOWED_USER_ID),
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }
-    ).encode("utf-8")
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    request = urllib.request.Request(
+    encoded: dict[str, str] = {}
+    for key, value in fields.items():
+        if isinstance(value, (dict, list)):
+            encoded[key] = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        elif isinstance(value, bool):
+            encoded[key] = "true" if value else "false"
+        else:
+            encoded[key] = str(value)
+
+    body = urllib.parse.urlencode(encoded).encode("utf-8")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    tg_request = urllib.request.Request(
         url,
         data=body,
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(tg_request, timeout=15) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not payload.get("ok"):
-        raise RuntimeError("Telegram rejected the login notification")
+        raise RuntimeError(f"Telegram API {method} failed")
+    return payload
+
+
+def telegram_send_approval(challenge_id: str, ip: str, user_agent: str) -> int:
+    message = (
+        "<b>Вход в Мониторинг АЗС</b>\n\n"
+        "Разрешить вход на <b>dashboard.opentaya.space</b>?\n\n"
+        f"IP: <code>{html.escape(ip)}</code>\n"
+        f"Устройство: {html.escape(user_agent[:140] or 'не определено')}\n"
+        f"Время: <code>{html.escape(iso(now_msk()))}</code>\n\n"
+        "Если это не вы — нажмите «Отклонить»."
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Принять",
+                    "callback_data": f"azs:approve:{challenge_id}",
+                },
+                {
+                    "text": "❌ Отклонить",
+                    "callback_data": f"azs:deny:{challenge_id}",
+                },
+            ]
+        ]
+    }
+    payload = telegram_api(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_ALLOWED_USER_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": keyboard,
+        },
+    )
+    return int(payload["result"]["message_id"])
+
+
+def telegram_finish_callback(
+    callback_id: str,
+    chat_id: int,
+    message_id: int,
+    approved: bool,
+) -> None:
+    text = "✅ Вход разрешён." if approved else "❌ Вход отклонён."
+    try:
+        telegram_api(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_id,
+                "text": text,
+                "show_alert": False,
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        telegram_api(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": (
+                    "<b>Мониторинг АЗС</b>\n\n"
+                    + text
+                    + f"\n\nВремя: <code>{html.escape(iso(now_msk()))}</code>"
+                ),
+                "parse_mode": "HTML",
+            },
+        )
+    except Exception:
+        pass
 
 
 def create_session(response: Response, request: Request) -> None:
@@ -900,7 +989,8 @@ PUBLIC_PATHS = {
     "/api/health",
     "/api/auth/status",
     "/api/auth/password",
-    "/api/auth/verify",
+    "/api/auth/poll",
+    "/api/auth/telegram/webhook",
     "/favicon.ico",
 }
 
@@ -944,7 +1034,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Geoportal40 AZS Dashboard",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -1005,9 +1095,11 @@ def login_page(request: Request):
 def auth_status(request: Request) -> dict[str, Any]:
     return {
         "configured": AUTH_ENABLED,
+        "telegram_approval_ready": TELEGRAM_APPROVAL_READY,
         "authenticated": bool(AUTH_ENABLED and is_authenticated(request)),
         "telegram_bot": "@my_fed_helper_robot",
         "session_hours": SESSION_HOURS,
+        "public_url": PUBLIC_BASE_URL or None,
     }
 
 
@@ -1015,6 +1107,11 @@ def auth_status(request: Request) -> dict[str, Any]:
 async def auth_password(request: Request):
     if not AUTH_ENABLED:
         raise HTTPException(status_code=503, detail="Авторизация ещё не настроена на сервере")
+    if not TELEGRAM_APPROVAL_READY:
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram-подтверждение ещё не настроено. Запусти setup_auth.sh на сервере.",
+        )
 
     ip = client_ip(request)
     remaining = lockout_remaining(ip)
@@ -1027,6 +1124,7 @@ async def auth_password(request: Request):
 
     payload = await read_json(request)
     password = str(payload.get("password", ""))
+
     if not password or len(password) > 256 or not password_matches(password):
         locked_for = record_auth_failure(ip)
         await asyncio.sleep(0.55)
@@ -1040,11 +1138,38 @@ async def auth_password(request: Request):
 
     clear_auth_failures(ip)
 
-    challenge_id = secrets.token_urlsafe(32)
-    code = f"{secrets.randbelow(1_000_000):06d}"
     now = unix_now()
-    expires = now + 180
     ua = short_ua(request)
+
+    # Do not spam Telegram if the browser repeats the request.
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        existing = conn.execute(
+            """
+            SELECT challenge_id, expires_at
+            FROM auth_challenge
+            WHERE ip = ?
+              AND user_agent = ?
+              AND consumed = 0
+              AND status = 'pending'
+              AND expires_at > ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (ip, ua, now),
+        ).fetchone()
+
+    if existing is not None:
+        return {
+            "ok": True,
+            "challenge_id": existing["challenge_id"],
+            "expires_in": max(1, int(existing["expires_at"]) - now),
+            "telegram_bot": "@my_fed_helper_robot",
+            "reused": True,
+        }
+
+    challenge_id = secrets.token_urlsafe(24)
+    expires = now + 180
 
     with db_connect() as conn:
         cleanup_auth(conn)
@@ -1052,31 +1177,43 @@ async def auth_password(request: Request):
             """
             INSERT INTO auth_challenge(
                 challenge_id, ip, user_agent, code_hash,
-                created_at, expires_at, attempts, consumed
+                created_at, expires_at, attempts, consumed, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0)
+            VALUES (?, ?, ?, '', ?, ?, 0, 0, 'pending')
             """,
-            (
-                challenge_id,
-                ip,
-                ua,
-                challenge_code_hash(challenge_id, code),
-                now,
-                expires,
-            ),
+            (challenge_id, ip, ua, now, expires),
         )
 
     try:
-        await asyncio.to_thread(telegram_send_code, code, ip, ua)
+        message_id = await asyncio.to_thread(
+            telegram_send_approval,
+            challenge_id,
+            ip,
+            ua,
+        )
     except Exception:
         with db_connect() as conn:
             conn.execute(
-                "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
+                """
+                UPDATE auth_challenge
+                SET consumed = 1, status = 'failed'
+                WHERE challenge_id = ?
+                """,
                 (challenge_id,),
             )
         raise HTTPException(
             status_code=502,
-            detail="Не удалось отправить код в Telegram. Проверьте бота и повторите вход.",
+            detail="Не удалось отправить запрос подтверждения в Telegram.",
+        )
+
+    with db_connect() as conn:
+        conn.execute(
+            """
+            UPDATE auth_challenge
+            SET telegram_message_id = ?
+            WHERE challenge_id = ?
+            """,
+            (message_id, challenge_id),
         )
 
     return {
@@ -1084,40 +1221,144 @@ async def auth_password(request: Request):
         "challenge_id": challenge_id,
         "expires_in": 180,
         "telegram_bot": "@my_fed_helper_robot",
+        "reused": False,
     }
 
 
-@app.post("/api/auth/verify")
-async def auth_verify(request: Request):
+@app.post("/api/auth/poll")
+async def auth_poll(request: Request):
     if not AUTH_ENABLED:
-        raise HTTPException(status_code=503, detail="Авторизация ещё не настроена на сервере")
-
-    ip = client_ip(request)
-    remaining = lockout_remaining(ip)
-    if remaining > 0:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Слишком много попыток. Повторите через {max(1, (remaining + 59) // 60)} мин.",
-            headers={"Retry-After": str(remaining)},
-        )
+        raise HTTPException(status_code=503, detail="Авторизация ещё не настроена")
 
     payload = await read_json(request)
-    challenge_id = str(payload.get("challenge_id", ""))[:200]
-    code = str(payload.get("code", "")).strip()
-
-    if not challenge_id or not (len(code) == 6 and code.isdigit()):
-        raise HTTPException(status_code=400, detail="Введите 6-значный код")
+    challenge_id = str(payload.get("challenge_id", ""))[:160]
+    if not challenge_id:
+        raise HTTPException(status_code=400, detail="Некорректный запрос на вход")
 
     now = unix_now()
-    wrong_attempts = None
-    wrong_consumed = False
-    expired = False
+    with db_connect() as conn:
+        cleanup_auth(conn)
+        row = conn.execute(
+            """
+            SELECT challenge_id, status, expires_at, consumed
+            FROM auth_challenge
+            WHERE challenge_id = ?
+            """,
+            (challenge_id,),
+        ).fetchone()
+
+        if row is None:
+            raise HTTPException(status_code=404, detail="Запрос на вход не найден")
+
+        if int(row["expires_at"]) <= now:
+            conn.execute(
+                """
+                UPDATE auth_challenge
+                SET consumed = 1, status = 'expired'
+                WHERE challenge_id = ?
+                """,
+                (challenge_id,),
+            )
+            return {"status": "expired"}
+
+        status = str(row["status"] or "pending")
+
+        if status == "denied":
+            if not row["consumed"]:
+                conn.execute(
+                    "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
+                    (challenge_id,),
+                )
+            return {"status": "denied"}
+
+        if status != "approved":
+            return {
+                "status": "pending",
+                "expires_in": max(1, int(row["expires_at"]) - now),
+            }
+
+        if row["consumed"]:
+            return {"status": "consumed"}
+
+        updated = conn.execute(
+            """
+            UPDATE auth_challenge
+            SET consumed = 1
+            WHERE challenge_id = ? AND consumed = 0 AND status = 'approved'
+            """,
+            (challenge_id,),
+        ).rowcount
+
+    if updated != 1:
+        return {"status": "consumed"}
+
+    response = JSONResponse({"status": "approved"})
+    create_session(response, request)
+    return response
+
+
+@app.post("/api/auth/telegram/webhook")
+async def telegram_webhook(request: Request):
+    if not TELEGRAM_APPROVAL_READY:
+        raise HTTPException(status_code=503, detail="Telegram webhook is not configured")
+
+    supplied = request.headers.get("x-telegram-bot-api-secret-token", "")
+    if not supplied or not hmac.compare_digest(supplied, TELEGRAM_WEBHOOK_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    payload = await read_json(request)
+    callback = payload.get("callback_query")
+    if not isinstance(callback, dict):
+        return {"ok": True}
+
+    from_user = callback.get("from") or {}
+    try:
+        from_id = int(from_user.get("id", 0))
+    except (TypeError, ValueError):
+        from_id = 0
+
+    callback_id = str(callback.get("id", ""))
+    data = str(callback.get("data", ""))
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+
+    try:
+        chat_id = int(chat.get("id", 0))
+        message_id = int(message.get("message_id", 0))
+    except (TypeError, ValueError):
+        chat_id = 0
+        message_id = 0
+
+    if from_id != TELEGRAM_ALLOWED_USER_ID or chat_id != TELEGRAM_ALLOWED_USER_ID:
+        if callback_id:
+            try:
+                await asyncio.to_thread(
+                    telegram_api,
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_id,
+                        "text": "Нет доступа",
+                        "show_alert": True,
+                    },
+                )
+            except Exception:
+                pass
+        return {"ok": True}
+
+    parts = data.split(":", 2)
+    if len(parts) != 3 or parts[0] != "azs" or parts[1] not in {"approve", "deny"}:
+        return {"ok": True}
+
+    decision = parts[1]
+    challenge_id = parts[2]
+    now = unix_now()
+    approved = decision == "approve"
 
     with db_connect() as conn:
         cleanup_auth(conn)
         row = conn.execute(
             """
-            SELECT challenge_id, ip, code_hash, expires_at, attempts, consumed
+            SELECT challenge_id, status, expires_at, consumed
             FROM auth_challenge
             WHERE challenge_id = ?
             """,
@@ -1125,44 +1366,60 @@ async def auth_verify(request: Request):
         ).fetchone()
 
         if row is None or row["consumed"]:
-            raise HTTPException(status_code=401, detail="Запрос на вход недействителен")
-
-        if int(row["expires_at"]) < now:
+            valid = False
+            expired = False
+        elif int(row["expires_at"]) <= now:
             conn.execute(
-                "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
-                (challenge_id,),
+                """
+                UPDATE auth_challenge
+                SET consumed = 1, status = 'expired', decision_at = ?
+                WHERE challenge_id = ?
+                """,
+                (now, challenge_id),
             )
+            valid = False
             expired = True
+        elif str(row["status"] or "pending") != "pending":
+            valid = False
+            expired = False
         else:
-            expected = row["code_hash"]
-            supplied = challenge_code_hash(challenge_id, code)
-            if not hmac.compare_digest(expected, supplied):
-                wrong_attempts = int(row["attempts"]) + 1
-                wrong_consumed = wrong_attempts >= 5
-                conn.execute(
-                    "UPDATE auth_challenge SET attempts = ?, consumed = ? WHERE challenge_id = ?",
-                    (wrong_attempts, int(wrong_consumed), challenge_id),
+            conn.execute(
+                """
+                UPDATE auth_challenge
+                SET status = ?, decision_at = ?
+                WHERE challenge_id = ? AND status = 'pending' AND consumed = 0
+                """,
+                ("approved" if approved else "denied", now, challenge_id),
+            )
+            valid = True
+            expired = False
+
+    if not valid:
+        if callback_id:
+            try:
+                await asyncio.to_thread(
+                    telegram_api,
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_id,
+                        "text": "Запрос уже недействителен" if expired else "Запрос уже обработан",
+                        "show_alert": False,
+                    },
                 )
-            else:
-                conn.execute(
-                    "UPDATE auth_challenge SET consumed = 1 WHERE challenge_id = ?",
-                    (challenge_id,),
-                )
+            except Exception:
+                pass
+        return {"ok": True}
 
-    if expired:
-        raise HTTPException(status_code=401, detail="Код истёк. Запросите новый")
+    if callback_id and chat_id and message_id:
+        await asyncio.to_thread(
+            telegram_finish_callback,
+            callback_id,
+            chat_id,
+            message_id,
+            approved,
+        )
 
-    if wrong_attempts is not None:
-        locked_for = record_auth_failure(ip)
-        await asyncio.sleep(0.35)
-        if wrong_consumed or locked_for:
-            raise HTTPException(status_code=429, detail="Слишком много неверных кодов. Начните вход заново")
-        raise HTTPException(status_code=401, detail=f"Неверный код. Осталось попыток: {5 - wrong_attempts}")
-
-    clear_auth_failures(ip)
-    response = JSONResponse({"ok": True})
-    create_session(response, request)
-    return response
+    return {"ok": True}
 
 
 @app.post("/api/auth/logout")
@@ -1201,6 +1458,7 @@ def health() -> dict[str, Any]:
         "poll_seconds": POLL_SECONDS,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "auth_configured": AUTH_ENABLED,
+        "telegram_approval_ready": TELEGRAM_APPROVAL_READY,
     }
 
 

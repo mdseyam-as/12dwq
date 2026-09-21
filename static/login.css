@@ -30,3 +30,10 @@ h1{margin:3px 0 0;font-size:25px;line-height:1.1}
 footer{margin-top:18px;padding-top:13px;border-top:1px solid #e2edf5;text-align:center;color:#8ca0b0;font-size:9px}
 [hidden]{display:none!important}
 @media(max-width:480px){.auth-shell{padding:10px}.auth-card{padding:18px;border-radius:20px}h1{font-size:22px}.brand-icon{width:46px;height:46px;flex-basis:46px}.auth-form input{height:46px}}
+
+.approval-wait{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid #d7e8f5;border-radius:13px;background:#fbfdff}
+.approval-wait strong,.approval-wait small{display:block}
+.approval-wait strong{font-size:11px}
+.approval-wait small{margin-top:3px;color:var(--muted);font-size:9px;line-height:1.4}
+.approval-spinner{width:26px;height:26px;flex:0 0 26px;border:3px solid #d8eaf7;border-top-color:#168bd5;border-radius:50%;animation:approval-spin .8s linear infinite}
+@keyframes approval-spin{to{transform:rotate(360deg)}}
