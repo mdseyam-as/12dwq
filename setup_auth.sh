@@ -85,7 +85,7 @@ echo
 echo "=== Устанавливаю Caddy ==="
 if ! command -v caddy >/dev/null 2>&1; then
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
+  NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
 fi
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
