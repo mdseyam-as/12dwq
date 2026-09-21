@@ -25,17 +25,9 @@
         </div>
       </div>
 
-      <div class="auth-status">
-        <span class="status-dot"></span>
-        <div>
-          <strong>Защищённый вход</strong>
-          <small>Пароль + подтверждение через Telegram</small>
-        </div>
-      </div>
-
       <div class="notice" id="notice" hidden></div>
 
-      <form id="passwordForm" class="auth-form">
+      <form id="passwordForm" class="auth-form auth-form-first">
         <label>
           <span>Пароль</span>
           <input id="password" type="password" autocomplete="current-password" maxlength="256" required autofocus>
@@ -43,7 +35,7 @@
         <button id="passwordBtn" type="submit">Продолжить</button>
       </form>
 
-      <section id="approvalPanel" class="auth-form" hidden>
+      <section id="approvalPanel" class="auth-form auth-form-first" hidden>
         <div class="telegram-box">
           <div class="telegram-icon">✈</div>
           <div>
