@@ -84,9 +84,26 @@ WEBHOOK_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(40))')
 echo
 echo "=== Устанавливаю Caddy ==="
 if ! command -v caddy >/dev/null 2>&1; then
+  export NEEDRESTART_MODE=a
+  export DEBIAN_FRONTEND=noninteractive
+
   apt-get update
-  NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y caddy
+  apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+
+  chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  chmod o+r /etc/apt/sources.list.d/caddy-stable.list
+
+  apt-get update
+  apt-get install -y caddy
 fi
+
+echo "Caddy: $(caddy version)"
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow 80/tcp >/dev/null
@@ -127,7 +144,6 @@ EOF
 mv .env.tmp .env
 chmod 600 .env
 
-# Keep Docker port reachable only from the VPS itself.
 cat > docker-compose.override.yml <<'EOF'
 services:
   azs-dashboard:
@@ -136,7 +152,7 @@ services:
 EOF
 printf '\ndocker-compose.override.yml\n' >> .git/info/exclude 2>/dev/null || true
 
-unset PASSWORD PASSWORD2 PASSWORD_HASH SESSION_SECRET
+unset PASSWORD PASSWORD2 PASSWORD_HASH SESSION_SECRET BOT_TOKEN WEBHOOK_SECRET
 
 echo
 echo "=== Перезапускаю приложение ==="
@@ -172,12 +188,15 @@ if [ "$HTTPS_OK" != "1" ]; then
   echo "HTTPS пока не поднялся. Последние логи Caddy:"
   journalctl -u caddy -n 60 --no-pager
   echo
-  echo "Когда DNS/порты 80 и 443 станут доступны, повтори этот скрипт."
+  echo "Проверь доступность портов 80/443 и повтори этот скрипт."
   exit 2
 fi
 
 echo
 echo "=== Регистрирую Telegram webhook ==="
+WEBHOOK_SECRET="$(grep '^AZS_TELEGRAM_WEBHOOK_SECRET=' .env | cut -d= -f2-)"
+BOT_TOKEN="$(grep '^AZS_TELEGRAM_BOT_TOKEN=' .env | cut -d= -f2-)"
+
 WEBHOOK_RESPONSE="$(curl -fsS --max-time 20 \
   --data-urlencode "url=https://${DOMAIN}/api/auth/telegram/webhook" \
   --data-urlencode "secret_token=${WEBHOOK_SECRET}" \
@@ -192,6 +211,7 @@ if ! printf '%s' "$WEBHOOK_RESPONSE" | jq -e '.ok == true' >/dev/null 2>&1; then
 fi
 
 WEBHOOK_INFO="$(curl -fsS --max-time 15 "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo")"
+unset BOT_TOKEN WEBHOOK_SECRET
 
 echo
 echo "=== HEALTH ==="
