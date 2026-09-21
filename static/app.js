@@ -120,12 +120,34 @@ function arc(cx,cy,r,a0,a1){
   return `M ${start.x} ${start.y} A ${r} ${r} 0 ${large} 0 ${end.x} ${end.y}`;
 }
 
+
+function hexToRgb(hex){
+  const raw=hex.replace("#","");
+  const n=parseInt(raw,16);
+  return {r:(n>>16)&255,g:(n>>8)&255,b:n&255};
+}
+function mixHex(hex, target="#ffffff", weight=.22){
+  const a=hexToRgb(hex), b=hexToRgb(target);
+  const c=["r","g","b"].map(k=>Math.round(a[k]+(b[k]-a[k])*weight));
+  return "#"+c.map(v=>v.toString(16).padStart(2,"0")).join("");
+}
+function animateNumber(el, next, {suffix="",duration=420}={}){
+  if(!el) return;
+  const target=Number(next)||0;
+  const current=Number(String(el.textContent||"").replace(/[^0-9.-]/g,""))||0;
+  if(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || current===target){el.textContent=`${target}${suffix}`;return;}
+  const started=performance.now();
+  const ease=t=>1-Math.pow(1-t,3);
+  const step=now=>{const t=Math.min(1,(now-started)/duration);el.textContent=`${Math.round(current+(target-current)*ease(t))}${suffix}`;if(t<1)requestAnimationFrame(step);};
+  requestAnimationFrame(step);
+}
+
 function renderKpis(){
   const rows = filteredStations();
   const available = rows.filter(stationAvailable).length;
-  $("#kpiAvailable").textContent = available;
-  $("#kpiTotal").textContent = rows.length;
-  $("#kpiCoverage").textContent = rows.length ? Math.round(available/rows.length*100)+"%" : "0%";
+  animateNumber($("#kpiAvailable"), available);
+  animateNumber($("#kpiTotal"), rows.length);
+  animateNumber($("#kpiCoverage"), rows.length ? Math.round(available/rows.length*100) : 0,{suffix:"%"});
 
   if(state.date === "live"){
     $("#kpiUpdated").textContent = state.fetchedAt ? fmtDateTime(state.fetchedAt) : "—";
@@ -141,48 +163,66 @@ function renderKpis(){
 function renderOwners(){
   const groups = ownerGroups();
   $("#ownerCount").textContent = groups.length;
-  const totalAvailable = groups.reduce((sum,g)=>sum+g.available,0);
-  $("#donutCenter").textContent = totalAvailable;
+  const activeGroups = groups.filter(g=>g.available>0);
+  const totalAvailable = activeGroups.reduce((sum,g)=>sum+g.available,0);
+  const overview = overviewStations();
+  const totalOverview = overview.length;
+  const coverage = totalOverview ? Math.round(totalAvailable/totalOverview*100) : 0;
+  animateNumber($("#donutCenter"), totalAvailable,{duration:520});
+
+  const centerLabel = $(".donut-center span");
+  if(centerLabel) centerLabel.textContent = `АЗС с топливом · ${coverage}%`;
 
   const svg = $("#donut");
+  const card = $(".donut-card");
   svg.innerHTML = "";
+  card?.classList.remove("has-hover");
   $("#donutEmpty").classList.toggle("show", totalAvailable === 0);
 
   if(totalAvailable > 0){
-    let angle = 0;
-    groups.filter(g=>g.available>0).forEach((g,index)=>{
-      const fraction = g.available/totalAvailable;
-      const next = angle + fraction*360;
-      const path = document.createElementNS("http://www.w3.org/2000/svg","path");
-      path.setAttribute("d", arc(220,170,103,angle,next));
-      path.setAttribute("fill","none");
-      path.setAttribute("stroke", COLORS[index%COLORS.length]);
-      path.setAttribute("stroke-width","50");
-      path.style.cursor="pointer";
-      path.style.transition="opacity .18s, filter .18s";
-      path.addEventListener("mouseenter",()=>{path.style.filter="brightness(1.08)";});
-      path.addEventListener("mouseleave",()=>{path.style.filter="";});
-      path.addEventListener("click",()=>drill(g.name));
-      svg.appendChild(path);
-      angle = next;
+    const ns="http://www.w3.org/2000/svg";
+    const defs=document.createElementNS(ns,"defs");
+    activeGroups.forEach((g,index)=>{
+      const base=COLORS[index%COLORS.length];
+      const grad=document.createElementNS(ns,"linearGradient");
+      grad.id=`donutGrad${index}`;
+      grad.setAttribute("x1","0%");grad.setAttribute("y1","0%");grad.setAttribute("x2","100%");grad.setAttribute("y2","100%");
+      const a=document.createElementNS(ns,"stop");a.setAttribute("offset","0%");a.setAttribute("stop-color",mixHex(base,"#ffffff",.20));
+      const b=document.createElementNS(ns,"stop");b.setAttribute("offset","58%");b.setAttribute("stop-color",base);
+      const c=document.createElementNS(ns,"stop");c.setAttribute("offset","100%");c.setAttribute("stop-color",mixHex(base,"#123a5e",.20));
+      grad.append(a,b,c);defs.appendChild(grad);
     });
+    svg.appendChild(defs);
 
-    const ring = document.createElementNS("http://www.w3.org/2000/svg","circle");
-    ring.setAttribute("cx","220"); ring.setAttribute("cy","170"); ring.setAttribute("r","77");
-    ring.setAttribute("fill","#fbfdff"); ring.setAttribute("stroke","#e2edf5");
-    svg.appendChild(ring);
+    const track=document.createElementNS(ns,"circle");
+    track.setAttribute("cx","220");track.setAttribute("cy","170");track.setAttribute("r","103");track.setAttribute("class","donut-track");svg.appendChild(track);
+
+    let angle=-90;
+    activeGroups.forEach((g,index)=>{
+      const fraction=g.available/totalAvailable;
+      const sweep=fraction*360;
+      const gap=Math.min(2.2,Math.max(.8,sweep*.035));
+      const d=arc(220,170,103,angle+gap/2,angle+sweep-gap/2);
+      const depth=document.createElementNS(ns,"path");depth.setAttribute("d",d);depth.setAttribute("class","donut-depth");svg.appendChild(depth);
+      const path=document.createElementNS(ns,"path");
+      path.setAttribute("d",d);path.setAttribute("class","donut-segment");path.setAttribute("pathLength","100");path.setAttribute("stroke",`url(#donutGrad${index})`);path.style.animationDelay=`${index*55}ms`;
+      path.setAttribute("tabindex","0");path.setAttribute("role","button");path.setAttribute("aria-label",`${g.name}: ${g.available} АЗС, ${Math.round(fraction*100)}%`);
+      const activate=()=>{card?.classList.add("has-hover");$$(".donut-segment",svg).forEach(n=>n.classList.remove("is-active"));path.classList.add("is-active");$("#donutCenter").textContent=g.available;if(centerLabel)centerLabel.textContent=`${g.name} · ${Math.round(fraction*100)}%`;};
+      const reset=()=>{card?.classList.remove("has-hover");path.classList.remove("is-active");$("#donutCenter").textContent=totalAvailable;if(centerLabel)centerLabel.textContent=`АЗС с топливом · ${coverage}%`;};
+      path.addEventListener("mouseenter",activate);path.addEventListener("focus",activate);path.addEventListener("mouseleave",reset);path.addEventListener("blur",reset);path.addEventListener("click",()=>drill(g.name));path.addEventListener("keydown",event=>{if(event.key==="Enter"||event.key===" "){event.preventDefault();drill(g.name);}});
+      svg.appendChild(path);angle+=sweep;
+    });
   }
 
-  $("#ownerList").innerHTML = groups.map((g,index)=>`
-    <button class="owner-row ${state.drilledOwner===g.name?"active":""}" type="button" data-owner="${esc(g.name)}">
-      <span class="owner-dot" style="background:${COLORS[index%COLORS.length]}"></span>
-      <span>
-        <span class="owner-name">${esc(g.name)}</span>
-        <span class="owner-meta">${g.available} с ${esc(state.fuels[state.fuel])} из ${g.total}</span>
-      </span>
-      <span class="owner-val">${g.total ? Math.round(g.available/g.total*100) : 0}%</span>
-    </button>`).join("");
-
+  $("#ownerList").innerHTML = groups.map((g,index)=>{
+    const pct=g.total ? Math.round(g.available/g.total*100) : 0;
+    const color=COLORS[index%COLORS.length];
+    return `<button class="owner-row ${state.drilledOwner===g.name?"active":""}" type="button" data-owner="${esc(g.name)}" style="--owner-color:${color}">
+      <span class="owner-dot" style="background:${color}"></span>
+      <span><span class="owner-name">${esc(g.name)}</span><span class="owner-meta">${g.available} с ${esc(state.fuels[state.fuel])} из ${g.total}</span><span class="owner-progress"><i style="width:${pct}%"></i></span></span>
+      <span class="owner-val">${pct}%</span>
+    </button>`;
+  }).join("");
   $$(".owner-row").forEach(btn=>btn.addEventListener("click",()=>drill(btn.dataset.owner)));
 }
 
