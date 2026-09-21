@@ -1,0 +1,696 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import urllib.error
+import urllib.request
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = Path(os.getenv("AZS_DB_PATH", str(DATA_DIR / "azs.sqlite3")))
+POLL_SECONDS = max(60, int(os.getenv("AZS_POLL_SECONDS", "300")))
+CACHE_TTL_SECONDS = max(15, int(os.getenv("AZS_CACHE_TTL_SECONDS", "60")))
+REQUEST_TIMEOUT = max(5, int(os.getenv("AZS_REQUEST_TIMEOUT", "20")))
+
+GEOPORTAL_BASE_URL = os.getenv("AZS_GEOPORTAL_BASE_URL", "https://azs.geoportal40.ru/").rstrip("/") + "/"
+GEOPORTAL_API_URL = os.getenv(
+    "AZS_GEOPORTAL_API_URL",
+    GEOPORTAL_BASE_URL
+    + "api/v1/tables/geoportal40/maps/azs/tables/1/geojson"
+    + "?srid=4326"
+    + "&fields=id"
+    + "&fields=ai92"
+    + "&fields=ai95"
+    + "&fields=dt"
+    + "&fields=ai98"
+    + "&fields=ai100"
+    + "&fields=ai95_1"
+    + "&fields=dt_1"
+    + "&fields=name2"
+    + "&fields=name3"
+    + "&fields=address",
+)
+
+MSK = timezone(timedelta(hours=3))
+_REFRESH_LOCK = threading.Lock()
+
+FUEL_KEYS = ("ai92", "ai95", "ai95_1", "dt", "dt_1", "ai98", "ai100")
+
+
+def now_msk() -> datetime:
+    return datetime.now(MSK)
+
+
+def iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS fetch_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                station_count INTEGER,
+                error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS station (
+                station_id INTEGER PRIMARY KEY,
+                owner_raw TEXT NOT NULL,
+                owner_group TEXT NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                longitude REAL NOT NULL,
+                latitude REAL NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_fetch_id INTEGER,
+                FOREIGN KEY(last_fetch_id) REFERENCES fetch_log(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                station_id INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                ai92 INTEGER NOT NULL,
+                ai95 INTEGER NOT NULL,
+                ai95_1 INTEGER NOT NULL,
+                dt INTEGER NOT NULL,
+                dt_1 INTEGER NOT NULL,
+                ai98 INTEGER NOT NULL,
+                ai100 INTEGER NOT NULL,
+                state_hash TEXT NOT NULL,
+                FOREIGN KEY(station_id) REFERENCES station(station_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snapshot_station_date
+                ON snapshot(station_id, snapshot_date, fetched_at);
+
+            CREATE INDEX IF NOT EXISTS idx_snapshot_date
+                ON snapshot(snapshot_date, fetched_at);
+
+            CREATE INDEX IF NOT EXISTS idx_station_last_fetch
+                ON station(last_fetch_id);
+            """
+        )
+
+
+def as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "да", "on"}
+
+
+def clean_text(value: Any) -> str:
+    return " ".join(str(value or "").replace("\u00a0", " ").split())
+
+
+def normalize_owner(owner: str) -> str:
+    owner = clean_text(owner)
+    if "калуганефтепродукт" in owner.lower():
+        return "Калуганефтепродукт"
+    return owner or "Не указан"
+
+
+def fetch_geoportal() -> dict[str, Any]:
+    request = urllib.request.Request(
+        GEOPORTAL_API_URL,
+        method="GET",
+        headers={
+            "Accept": "application/geo+json, application/json",
+            "User-Agent": "AZS-Dashboard/1.0 (+Geoportal40 monitoring)",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        raw = response.read()
+        if response.status < 200 or response.status >= 300:
+            raise RuntimeError(f"Geoportal HTTP {response.status}")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError("Geoportal returned invalid JSON") from exc
+    return payload
+
+
+def parse_geojson(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if payload.get("type") != "FeatureCollection":
+        raise RuntimeError("Unexpected Geoportal response: not a FeatureCollection")
+
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise RuntimeError("Unexpected Geoportal response: features is missing")
+
+    rows: list[dict[str, Any]] = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+
+        props = feature.get("properties") or {}
+        geom = feature.get("geometry") or {}
+        coords = geom.get("coordinates") or []
+
+        try:
+            station_id = int(props.get("id", feature.get("id")))
+            lon = float(coords[0])
+            lat = float(coords[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+
+        owner_raw = clean_text(props.get("name2"))
+        name = clean_text(props.get("name3")) or f"АЗС {station_id}"
+        address = clean_text(props.get("address"))
+
+        fuels = {key: as_bool(props.get(key)) for key in FUEL_KEYS}
+
+        rows.append(
+            {
+                "station_id": station_id,
+                "owner_raw": owner_raw,
+                "owner_group": normalize_owner(owner_raw),
+                "name": name,
+                "address": address,
+                "longitude": lon,
+                "latitude": lat,
+                **fuels,
+            }
+        )
+
+    if not rows:
+        raise RuntimeError("Geoportal returned no valid stations")
+
+    rows.sort(key=lambda x: x["station_id"])
+    return rows
+
+
+def state_hash(row: dict[str, Any]) -> str:
+    state = "|".join("1" if row[key] else "0" for key in FUEL_KEYS)
+    return hashlib.sha1(state.encode("ascii")).hexdigest()
+
+
+def last_success_fetch(conn: sqlite3.Connection | None = None) -> sqlite3.Row | None:
+    owns = conn is None
+    conn = conn or db_connect()
+    try:
+        return conn.execute(
+            """
+            SELECT id, fetched_at, station_count
+            FROM fetch_log
+            WHERE ok = 1
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        if owns:
+            conn.close()
+
+
+def last_failed_fetch() -> sqlite3.Row | None:
+    with db_connect() as conn:
+        return conn.execute(
+            """
+            SELECT fetched_at, error
+            FROM fetch_log
+            WHERE ok = 0
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+def seconds_since(value: str) -> float:
+    try:
+        dt = datetime.fromisoformat(value)
+        return max(0.0, (now_msk() - dt).total_seconds())
+    except Exception:
+        return 10**9
+
+
+def store_fetch(rows: list[dict[str, Any]], fetched_at: datetime) -> dict[str, Any]:
+    fetched = iso(fetched_at)
+    snap_date = fetched_at.date().isoformat()
+
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT INTO fetch_log(fetched_at, ok, station_count, error) VALUES (?, 1, ?, NULL)",
+            (fetched, len(rows)),
+        )
+        fetch_id = int(cur.lastrowid)
+        inserted_snapshots = 0
+
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO station(
+                    station_id, owner_raw, owner_group, name, address,
+                    longitude, latitude, first_seen_at, last_seen_at, last_fetch_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(station_id) DO UPDATE SET
+                    owner_raw=excluded.owner_raw,
+                    owner_group=excluded.owner_group,
+                    name=excluded.name,
+                    address=excluded.address,
+                    longitude=excluded.longitude,
+                    latitude=excluded.latitude,
+                    last_seen_at=excluded.last_seen_at,
+                    last_fetch_id=excluded.last_fetch_id
+                """,
+                (
+                    row["station_id"],
+                    row["owner_raw"],
+                    row["owner_group"],
+                    row["name"],
+                    row["address"],
+                    row["longitude"],
+                    row["latitude"],
+                    fetched,
+                    fetched,
+                    fetch_id,
+                ),
+            )
+
+            h = state_hash(row)
+            prev = conn.execute(
+                """
+                SELECT snapshot_date, state_hash
+                FROM snapshot
+                WHERE station_id = ?
+                ORDER BY fetched_at DESC, id DESC
+                LIMIT 1
+                """,
+                (row["station_id"],),
+            ).fetchone()
+
+            should_insert = (
+                prev is None
+                or prev["state_hash"] != h
+                or prev["snapshot_date"] != snap_date
+            )
+
+            if should_insert:
+                conn.execute(
+                    """
+                    INSERT INTO snapshot(
+                        station_id, fetched_at, snapshot_date,
+                        ai92, ai95, ai95_1, dt, dt_1, ai98, ai100, state_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["station_id"],
+                        fetched,
+                        snap_date,
+                        int(row["ai92"]),
+                        int(row["ai95"]),
+                        int(row["ai95_1"]),
+                        int(row["dt"]),
+                        int(row["dt_1"]),
+                        int(row["ai98"]),
+                        int(row["ai100"]),
+                        h,
+                    ),
+                )
+                inserted_snapshots += 1
+
+        conn.commit()
+
+    return {
+        "fetch_id": fetch_id,
+        "fetched_at": fetched,
+        "station_count": len(rows),
+        "inserted_snapshots": inserted_snapshots,
+    }
+
+
+def record_failure(error: Exception) -> None:
+    message = clean_text(str(error))[:1000] or error.__class__.__name__
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO fetch_log(fetched_at, ok, station_count, error) VALUES (?, 0, NULL, ?)",
+            (iso(now_msk()), message),
+        )
+
+
+def refresh_geoportal(force: bool = False) -> dict[str, Any]:
+    with _REFRESH_LOCK:
+        with db_connect() as conn:
+            previous = last_success_fetch(conn)
+            if (
+                not force
+                and previous is not None
+                and seconds_since(previous["fetched_at"]) < CACHE_TTL_SECONDS
+            ):
+                return {
+                    "ok": True,
+                    "cached": True,
+                    "fetched_at": previous["fetched_at"],
+                    "station_count": previous["station_count"],
+                }
+
+        try:
+            rows = parse_geojson(fetch_geoportal())
+            result = store_fetch(rows, now_msk())
+            return {"ok": True, "cached": False, **result}
+        except Exception as exc:
+            record_failure(exc)
+            previous = last_success_fetch()
+            if previous is not None:
+                return {
+                    "ok": False,
+                    "cached": True,
+                    "fetched_at": previous["fetched_at"],
+                    "station_count": previous["station_count"],
+                    "error": clean_text(str(exc)),
+                }
+            raise
+
+
+def serialize_station(row: sqlite3.Row) -> dict[str, Any]:
+    fuels = {key: bool(row[key]) for key in FUEL_KEYS}
+    return {
+        "id": row["station_id"],
+        "owner_raw": row["owner_raw"],
+        "owner": row["owner_group"],
+        "name": row["name"],
+        "address": row["address"],
+        "longitude": row["longitude"],
+        "latitude": row["latitude"],
+        "fetched_at": row["fetched_at"],
+        "snapshot_date": row["snapshot_date"],
+        "fuels": fuels,
+        "available_any": any(fuels.values()),
+        "portal_url": f"{GEOPORTAL_BASE_URL}#{row['longitude']}_{row['latitude']}_17",
+    }
+
+
+def get_current_stations() -> tuple[list[dict[str, Any]], sqlite3.Row | None]:
+    with db_connect() as conn:
+        fetch = last_success_fetch(conn)
+        if fetch is None:
+            return [], None
+
+        rows = conn.execute(
+            """
+            SELECT
+                s.station_id, s.owner_raw, s.owner_group, s.name, s.address,
+                s.longitude, s.latitude,
+                ? AS fetched_at, p.snapshot_date,
+                p.ai92, p.ai95, p.ai95_1, p.dt, p.dt_1, p.ai98, p.ai100
+            FROM station s
+            JOIN snapshot p ON p.id = (
+                SELECT p2.id
+                FROM snapshot p2
+                WHERE p2.station_id = s.station_id
+                ORDER BY p2.fetched_at DESC, p2.id DESC
+                LIMIT 1
+            )
+            WHERE s.last_fetch_id = ?
+            ORDER BY s.owner_group COLLATE NOCASE, s.name COLLATE NOCASE
+            """,
+            (fetch["fetched_at"], fetch["id"]),
+        ).fetchall()
+
+        return [serialize_station(row) for row in rows], fetch
+
+
+def get_historical_stations(snapshot_date: str) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                s.station_id, s.owner_raw, s.owner_group, s.name, s.address,
+                s.longitude, s.latitude,
+                p.fetched_at, p.snapshot_date,
+                p.ai92, p.ai95, p.ai95_1, p.dt, p.dt_1, p.ai98, p.ai100
+            FROM station s
+            JOIN snapshot p ON p.id = (
+                SELECT p2.id
+                FROM snapshot p2
+                WHERE p2.station_id = s.station_id
+                  AND p2.snapshot_date = ?
+                ORDER BY p2.fetched_at DESC, p2.id DESC
+                LIMIT 1
+            )
+            ORDER BY s.owner_group COLLATE NOCASE, s.name COLLATE NOCASE
+            """,
+            (snapshot_date,),
+        ).fetchall()
+        return [serialize_station(row) for row in rows]
+
+
+def available_dates(limit: int = 120) -> list[str]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT snapshot_date
+            FROM snapshot
+            ORDER BY snapshot_date DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [row["snapshot_date"] for row in rows]
+
+
+def station_history(station_id: int, days: int) -> dict[str, Any]:
+    end = now_msk().date()
+    start = end - timedelta(days=days - 1)
+
+    with db_connect() as conn:
+        station = conn.execute(
+            """
+            SELECT station_id, owner_group, name, address, longitude, latitude
+            FROM station
+            WHERE station_id = ?
+            """,
+            (station_id,),
+        ).fetchone()
+
+        if station is None:
+            raise HTTPException(status_code=404, detail="Station not found")
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM snapshot
+            WHERE station_id = ?
+              AND snapshot_date BETWEEN ? AND ?
+            ORDER BY snapshot_date ASC, fetched_at ASC, id ASC
+            """,
+            (station_id, start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+    latest_by_day: dict[str, sqlite3.Row] = {}
+    changes_by_day: dict[str, int] = {}
+    previous_hash_by_day: dict[str, str] = {}
+
+    for row in rows:
+        day = row["snapshot_date"]
+        latest_by_day[day] = row
+        if day not in previous_hash_by_day:
+            previous_hash_by_day[day] = row["state_hash"]
+            changes_by_day[day] = 0
+        elif previous_hash_by_day[day] != row["state_hash"]:
+            changes_by_day[day] += 1
+            previous_hash_by_day[day] = row["state_hash"]
+
+    daily = []
+    cursor = start
+    while cursor <= end:
+        key = cursor.isoformat()
+        row = latest_by_day.get(key)
+        if row is None:
+            daily.append({"date": key, "known": False, "fetched_at": None, "changes": 0, "fuels": None})
+        else:
+            daily.append(
+                {
+                    "date": key,
+                    "known": True,
+                    "fetched_at": row["fetched_at"],
+                    "changes": changes_by_day.get(key, 0),
+                    "fuels": {fuel: bool(row[fuel]) for fuel in FUEL_KEYS},
+                }
+            )
+        cursor += timedelta(days=1)
+
+    return {
+        "station": {
+            "id": station["station_id"],
+            "owner": station["owner_group"],
+            "name": station["name"],
+            "address": station["address"],
+            "longitude": station["longitude"],
+            "latitude": station["latitude"],
+        },
+        "days": days,
+        "history": daily,
+    }
+
+
+async def poller() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(refresh_geoportal, True)
+        except Exception:
+            pass
+        await asyncio.sleep(POLL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    try:
+        await asyncio.to_thread(refresh_geoportal, False)
+    except Exception:
+        pass
+
+    task = asyncio.create_task(poller())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Geoportal40 AZS Dashboard", version="1.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    last_ok = last_success_fetch()
+    last_fail = last_failed_fetch()
+    return {
+        "ok": last_ok is not None,
+        "geoportal_base_url": GEOPORTAL_BASE_URL,
+        "last_success": dict(last_ok) if last_ok else None,
+        "last_failure": dict(last_fail) if last_fail else None,
+        "poll_seconds": POLL_SECONDS,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+    }
+
+
+@app.get("/api/meta")
+def meta() -> dict[str, Any]:
+    try:
+        refresh = refresh_geoportal(False)
+    except Exception as exc:
+        refresh = {"ok": False, "cached": False, "error": clean_text(str(exc))}
+    last_ok = last_success_fetch()
+    last_fail = last_failed_fetch()
+    return {
+        "refresh": refresh,
+        "last_success": dict(last_ok) if last_ok else None,
+        "last_failure": dict(last_fail) if last_fail else None,
+        "dates": available_dates(),
+        "fuels": {
+            "ai92": "АИ-92",
+            "ai95": "АИ-95",
+            "ai95_1": "АИ-95+",
+            "dt": "ДТ",
+            "dt_1": "ДТ+",
+            "ai98": "АИ-98",
+            "ai100": "АИ-100",
+        },
+    }
+
+
+@app.get("/api/stations")
+def stations(
+    date: str | None = Query(default=None, description="YYYY-MM-DD; omit for current Geoportal state"),
+    force: bool = Query(default=False),
+) -> dict[str, Any]:
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+        rows = get_historical_stations(date)
+        return {
+            "mode": "history",
+            "date": date,
+            "stale": False,
+            "count": len(rows),
+            "stations": rows,
+        }
+
+    try:
+        refresh = refresh_geoportal(force)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Geoportal unavailable and cache is empty: {exc}")
+
+    rows, fetch = get_current_stations()
+    return {
+        "mode": "live",
+        "date": None,
+        "stale": not bool(refresh.get("ok")),
+        "refresh_error": refresh.get("error"),
+        "fetched_at": fetch["fetched_at"] if fetch else None,
+        "count": len(rows),
+        "stations": rows,
+    }
+
+
+@app.get("/api/history/{station_id}")
+def history(
+    station_id: int,
+    days: int = Query(default=30, ge=1, le=180),
+) -> dict[str, Any]:
+    return station_history(station_id, days)
+
+
+@app.post("/api/refresh")
+def force_refresh() -> dict[str, Any]:
+    try:
+        result = refresh_geoportal(True)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Geoportal refresh failed: {exc}")
+    rows, fetch = get_current_stations()
+    return {
+        **result,
+        "current_count": len(rows),
+        "current_fetched_at": fetch["fetched_at"] if fetch else None,
+    }

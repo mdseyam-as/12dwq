@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Мониторинг АЗС — Калужская область</title>
+  <meta name="theme-color" content="#edf7ff">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="app">
+    <section class="hero">
+      <div class="hero-main">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M7 21V5.5A2.5 2.5 0 0 1 9.5 3h5A2.5 2.5 0 0 1 17 5.5V21"></path>
+            <rect x="9" y="6" width="6" height="5" rx="1"></rect>
+            <path d="M17 8h1.5l2 2.5V16a2 2 0 0 1-2 2H17"></path>
+            <path d="M5 21h14"></path>
+          </svg>
+        </div>
+        <div class="hero-copy">
+          <div class="eyebrow">Калужская область</div>
+          <h1>Мониторинг АЗС</h1>
+          <div class="subtitle">Наличие топлива на автозаправочных станциях по данным Geoportal40</div>
+        </div>
+      </div>
+
+      <div class="source-state">
+        <span class="source-dot" id="sourceDot"></span>
+        <div>
+          <strong id="sourceState">Подключение к Geoportal40…</strong>
+          <small id="sourceMeta">Получаем актуальный срез</small>
+        </div>
+        <button class="refresh-btn" id="refreshBtn" type="button">Обновить</button>
+      </div>
+
+      <div class="filters">
+        <label class="field">
+          <span>Срез</span>
+          <select id="dateFilter"></select>
+        </label>
+        <label class="field">
+          <span>Топливо</span>
+          <select id="fuelFilter"></select>
+        </label>
+        <label class="field">
+          <span>Владелец</span>
+          <select id="ownerFilter">
+            <option value="">Все владельцы</option>
+          </select>
+        </label>
+        <label class="field field-search">
+          <span>Поиск</span>
+          <input id="searchFilter" type="search" placeholder="Название или адрес АЗС" autocomplete="off">
+        </label>
+        <button class="reset-btn" id="resetBtn" type="button">Сбросить</button>
+      </div>
+    </section>
+
+    <section class="kpi-grid">
+      <article class="kpi kpi-ok">
+        <span>С выбранным топливом</span>
+        <strong id="kpiAvailable">0</strong>
+        <small id="kpiAvailableNote">из текущего среза</small>
+      </article>
+      <article class="kpi">
+        <span>Всего АЗС</span>
+        <strong id="kpiTotal">0</strong>
+        <small>после фильтрации</small>
+      </article>
+      <article class="kpi">
+        <span>Обеспеченность</span>
+        <strong id="kpiCoverage">0%</strong>
+        <small>доля АЗС с топливом</small>
+      </article>
+      <article class="kpi">
+        <span>Получено с портала</span>
+        <strong class="kpi-date" id="kpiUpdated">—</strong>
+        <small id="kpiUpdatedNote">последний успешный запрос</small>
+      </article>
+    </section>
+
+    <section class="dashboard-grid">
+      <article class="panel overview-panel">
+        <header class="panel-head">
+          <div>
+            <div class="panel-title">Наличие топлива по владельцам</div>
+            <div class="panel-sub">Нажмите на сектор или владельца для перехода к списку АЗС</div>
+          </div>
+          <span class="count-pill" id="ownerCount">0</span>
+        </header>
+        <div class="overview-body">
+          <div class="donut-card">
+            <svg id="donut" viewBox="0 0 440 340" role="img" aria-label="Распределение АЗС по владельцам"></svg>
+            <div class="donut-center">
+              <strong id="donutCenter">0</strong>
+              <span>АЗС с топливом</span>
+            </div>
+            <div class="donut-empty" id="donutEmpty">Нет АЗС с выбранным топливом</div>
+          </div>
+          <div class="owner-list" id="ownerList"></div>
+        </div>
+      </article>
+
+      <article class="panel map-panel">
+        <header class="panel-head">
+          <div>
+            <div class="panel-title">Карта АЗС</div>
+            <div class="panel-sub" id="mapSubtitle">Официальная карта Geoportal40</div>
+          </div>
+          <div class="map-actions">
+            <button class="map-reset" id="mapReset" type="button">Все АЗС</button>
+            <a class="map-external" id="mapExternal" href="https://azs.geoportal40.ru/" target="_blank" rel="noopener noreferrer">На портале ↗</a>
+          </div>
+        </header>
+        <div class="map-selection" id="mapSelection">
+          <span class="map-selection-dot"></span>
+          <div>
+            <strong id="mapSelectionName">АЗС не выбрана</strong>
+            <small id="mapSelectionAddress">Нажмите «На карте» в списке</small>
+          </div>
+        </div>
+        <div class="map-frame-wrap">
+          <div class="map-loader" id="mapLoader"><span></span><b>Загрузка карты…</b></div>
+          <iframe id="mapFrame" src="https://azs.geoportal40.ru/" title="Карта АЗС Калужской области" loading="eager" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel station-panel" id="stationPanel">
+      <header class="station-head">
+        <div class="station-head-main">
+          <button class="back-btn" id="backBtn" type="button" aria-label="Вернуться к владельцам">←</button>
+          <div>
+            <div class="eyebrow">Заправочные станции</div>
+            <div class="station-title" id="stationTitle">Все АЗС</div>
+            <div class="station-subtitle" id="stationSubtitle">Адреса и наличие выбранного топлива</div>
+          </div>
+        </div>
+        <div class="station-controls">
+          <button class="mode-btn active" id="modeAll" type="button">Все АЗС</button>
+          <button class="mode-btn" id="modeAvailable" type="button">Только с топливом</button>
+          <span class="count-pill" id="visibleCount">0</span>
+        </div>
+      </header>
+      <div class="station-columns">
+        <span>№</span><span>АЗС и адрес</span><span>Действия</span>
+      </div>
+      <div class="station-loading" id="stationLoading">Получаем данные…</div>
+      <div class="station-list" id="stationList"></div>
+      <div class="empty-state" id="emptyState">
+        <div class="empty-icon">⌕</div>
+        <strong>Станции не найдены</strong>
+        <span>Измените поиск или фильтры</span>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>Источник: azs.geoportal40.ru</span>
+      <span id="footerState">Архив истории ведётся локально приложением</span>
+    </footer>
+  </main>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+services:
+  azs-dashboard:
+    build: .
+    container_name: azs-dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      AZS_POLL_SECONDS: "300"
+      AZS_CACHE_TTL_SECONDS: "60"
+      AZS_REQUEST_TIMEOUT: "20"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
